@@ -1,0 +1,90 @@
+{
+	"geode": "5.6.1",
+	"gd": {
+		"win": "2.2081",
+		"mac": "2.2081",
+		"android": "2.2081",
+		"ios": "2.2081"
+	},
+	"id": "liveychat.youtube-chat",
+	"name": "LiveyChat",
+	"version": "v1.0.0",
+	"developer": "LiveyChat",
+	"description": "Displays live YouTube chat messages in-game, with clickable level IDs.",
+	"tags": ["online", "interface", "enhancement"],
+	"settings": {
+		"enabled": {
+			"type": "bool",
+			"name": "Enabled",
+			"description": "Show the live chat overlay.",
+			"default": true
+		},
+		"show-title": {
+			"type": "bool",
+			"name": "Show Title",
+			"description": "Show the 'LIVE CHAT' header text.",
+			"default": true
+		},
+		"show-status": {
+			"type": "bool",
+			"name": "Show Status",
+			"description": "Show the connection status text (Connected, errors, ...).",
+			"default": true
+		},
+		"video-id": {
+			"type": "string",
+			"name": "YouTube Video ID",
+			"description": "The 11-character video ID of the live stream (e.g. dQw4w9WgXcQ).",
+			"default": ""
+		},
+		"chat-id": {
+			"type": "string",
+			"name": "Live Chat ID (optional)",
+			"description": "A raw activeLiveChatId. Overrides Video ID when set.",
+			"default": ""
+		},
+		"api-key": {
+			"type": "string",
+			"name": "YouTube Data API Key",
+			"description": "A valid API key for the YouTube Data API v3 (required).",
+			"default": ""
+		},
+		"position": {
+			"type": "string",
+			"name": "Overlay Position",
+			"description": "Which corner the overlay anchors to.",
+			"default": "top-right",
+			"one-of": ["top-right", "top-left", "bottom-right", "bottom-left"]
+		},
+		"opacity": {
+			"type": "float",
+			"name": "Background Opacity",
+			"description": "Opacity of the overlay background.",
+			"default": 0.55,
+			"min": 0.0,
+			"max": 1.0,
+			"control": {
+				"slider": true
+			}
+		},
+		"max-messages": {
+			"type": "int",
+			"name": "Max Messages",
+			"description": "How many recent messages to keep on screen.",
+			"default": 7,
+			"min": 1,
+			"max": 20
+		},
+		"poll-interval": {
+			"type": "float",
+			"name": "Poll Interval (seconds)",
+			"description": "How often to fetch new chat messages.",
+			"default": 5.0,
+			"min": 1.0,
+			"max": 60.0,
+			"control": {
+				"slider": true
+			}
+		}
+	}
+}
