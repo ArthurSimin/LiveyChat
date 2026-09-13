@@ -28,6 +28,12 @@ clickable number that opens that level in-game.
 
 ---
 
+  ## Preview
+  <img width="1600" height="900" alt="image" src="https://github.com/user-attachments/assets/7b1fd7a9-f2b7-4824-b840-829bf81ab38d" />
+
+
+---
+
 ## Requirements
 
 - Geometry Dash **2.2081** or later (the 2.2 Steam version).
