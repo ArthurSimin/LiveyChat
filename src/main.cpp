@@ -17,6 +17,7 @@
 #include <cstdint>
 #include <regex>
 #include <string>
+#include <unordered_set>
 #include <vector>
 
 using namespace geode::prelude;
@@ -29,10 +30,104 @@ using namespace geode::prelude;
 constexpr float kMaxPanelWidth = 400.0f;   // hard cap so very long messages wrap
 constexpr float kMinPanelWidth = 150.0f;
 constexpr float kTextWrapWidth = 360.0f;   // wrap width for message text
-constexpr float kPad           = 10.0f;    // outer padding
+constexpr float kPad           = 10.0f;    // outer padding (default when headers are visible)
 constexpr float kRowGap        = 4.0f;     // vertical gap between message rows
-constexpr float kLineHeight    = 15.0f;    // flow-layout line height
+constexpr float kLineHeight    = 14.0f;    // flow-layout line height
 constexpr float kWordGap       = 4.0f;     // horizontal gap between words/IDs
+
+// Vibrant streamer username color palette (Twitch / Kick / Streamlabs style)
+static const ccColor3B kStreamerColors[] = {
+    { 255, 75, 75 },    // Bright Red
+    { 59, 130, 246 },   // Royal / Dodger Blue
+    { 34, 197, 94 },    // Spring Green
+    { 168, 85, 247 },   // Violet / Purple
+    { 249, 115, 22 },   // Vibrant Orange
+    { 234, 179, 8 },    // Amber / Gold
+    { 6, 182, 212 },    // Cyan / Teal
+    { 132, 204, 22 },   // Lime Green
+    { 236, 72, 153 },   // Hot Pink
+    { 56, 189, 248 },   // Sky Blue
+    { 234, 88, 12 },    // Deep Orange
+    { 16, 185, 129 },   // Emerald / Mint
+    { 192, 132, 252 },  // Lavender
+    { 244, 63, 94 },    // Rose
+    { 20, 184, 166 },   // Dark Teal
+    { 250, 204, 21 },   // Yellow
+};
+
+static ccColor3B getAuthorColor(std::string const& author) {
+    uint32_t hash = 5381;
+    for (unsigned char c : author) {
+        hash = ((hash << 5) + hash) + static_cast<uint32_t>(static_cast<unsigned char>(std::tolower(c)));
+    }
+    constexpr size_t count = sizeof(kStreamerColors) / sizeof(kStreamerColors[0]);
+    return kStreamerColors[hash % count];
+}
+
+// Realistic diffused drop shadow (emulating Photopea / Photoshop external drop shadow blur)
+struct ShadowTap {
+    float dx;
+    float dy;
+    GLubyte opacity;
+};
+
+static const ShadowTap kPhotopeaShadow[] = {
+    {  0.5f, -1.2f,  90 }, // Core center shadow (120° light angle)
+    {  0.5f, -0.6f,  45 }, // Up feather
+    {  0.5f, -1.8f,  45 }, // Down feather
+    { -0.1f, -1.2f,  45 }, // Left feather
+    {  1.1f, -1.2f,  45 }, // Right feather
+    {  1.0f, -1.7f,  30 }, // Down-right diagonal feather
+    {  0.0f, -1.7f,  30 }, // Down-left diagonal feather
+};
+
+// Creates a natural clean text label with a realistic blurred external drop shadow
+static CCNode* createShadowedLabel(
+    std::string const& text,
+    const char* font,
+    float scale,
+    ccColor3B color,
+    float* outWidth = nullptr,
+    float* outHeight = nullptr,
+    bool isClickable = false
+) {
+    auto* container = CCNode::create();
+    container->ignoreAnchorPointForPosition(false);
+
+    // Realistic diffused drop shadow taps (soft Gaussian-like falloff)
+    for (auto const& tap : kPhotopeaShadow) {
+        auto* shadow = CCLabelBMFont::create(text.c_str(), font);
+        shadow->setScale(scale);
+        shadow->setColor(ccc3(0, 0, 0));
+        shadow->setOpacity(tap.opacity);
+        shadow->setAnchorPoint(ccp(0.0f, 0.0f));
+        shadow->setPosition(ccp(tap.dx, tap.dy));
+        container->addChild(shadow);
+    }
+
+    // Main text label (clean, crisp, natural font weight - no artificial bold)
+    auto* base = CCLabelBMFont::create(text.c_str(), font);
+    base->setScale(scale);
+    base->setColor(color);
+    base->setAnchorPoint(ccp(0.0f, 0.0f));
+    base->setPosition(ccp(0.0f, 0.0f));
+    container->addChild(base);
+
+    float w = base->getContentSize().width * scale;
+    float h = base->getContentSize().height * scale;
+    container->setContentSize(CCSize(w, h));
+
+    if (isClickable) {
+        container->setAnchorPoint(ccp(0.5f, 0.5f));
+    } else {
+        container->setAnchorPoint(ccp(0.0f, 1.0f));
+    }
+
+    if (outWidth) *outWidth = w;
+    if (outHeight) *outHeight = h;
+
+    return container;
+}
 
 // Regex used to detect candidate level IDs inside a chat message.
 // Matches a run of digits (optionally separated by commas, since people insert
@@ -46,13 +141,21 @@ static const std::regex kLevelIDRegex(R"(\b\d[\d,]*\d\b)");
 // ---------------------------------------------------------------------------
 
 struct ChatMessage {
+    std::string id;
     std::string author;
+    std::string channelId;
     std::string text;
 };
 
 struct FetchResult {
-    std::vector<ChatMessage> messages;
+    std::vector<ChatMessage> newMessages;
+    std::vector<std::string> deletedMessageIds;
+    std::vector<std::string> bannedChannelIds;
+    std::vector<std::string> bannedUserNames;
+    std::vector<std::string> activeMessageIds;
+    bool isSync = false;
     std::string status;     // short human-readable state ("Connected", errors…)
+    uint64_t suggestedPollIntervalMs = 0;
 };
 
 // A snapshot of config read on the main thread, consumed by network coroutines.
@@ -152,8 +255,20 @@ static arc::Future<Result<std::string, std::string>> resolveChatId(Config const&
 
     web::WebRequest req;
     auto res = co_await req.get(url);
-    if (!res.ok())
+    if (!res.ok()) {
+        std::string errDetail;
+        auto parsed = matjson::parse(res.string().unwrapOr("{}"));
+        if (parsed) {
+            auto root = parsed.unwrap();
+            if (root.contains("error") && root["error"].contains("message")) {
+                errDetail = root["error"]["message"].asString().unwrapOr("");
+            }
+        }
+        if (!errDetail.empty()) {
+            co_return Err(fmt::format("YouTube error (HTTP {}): {}", res.code(), errDetail));
+        }
         co_return Err(fmt::format("YouTube request failed (HTTP {})", res.code()));
+    }
 
     auto parsed = matjson::parse(res.string().unwrapOr("{}"));
     if (!parsed)
@@ -185,20 +300,33 @@ static arc::Future<Result<std::string, std::string>> resolveChatId(Config const&
 }
 
 static arc::Future<Result<FetchResult, std::string>> fetchChatMessages(
-    Config const& cfg, std::string const& chatId, std::string& pageToken)
+    Config const& cfg, std::string const& chatId, std::string& pageToken, bool isSync)
 {
     FetchResult out;
+    out.isSync = isSync;
 
     std::string url = fmt::format(
         "https://www.googleapis.com/youtube/v3/liveChat/messages?part=snippet,authorDetails&liveChatId={}&key={}",
         chatId, cfg.apiKey);
-    if (!pageToken.empty())
+    if (!isSync && !pageToken.empty())
         url += "&pageToken=" + pageToken;
 
     web::WebRequest req;
     auto res = co_await req.get(url);
-    if (!res.ok())
+    if (!res.ok()) {
+        std::string errDetail;
+        auto parsed = matjson::parse(res.string().unwrapOr("{}"));
+        if (parsed) {
+            auto root = parsed.unwrap();
+            if (root.contains("error") && root["error"].contains("message")) {
+                errDetail = root["error"]["message"].asString().unwrapOr("");
+            }
+        }
+        if (!errDetail.empty()) {
+            co_return Err(fmt::format("YouTube error (HTTP {}): {}", res.code(), errDetail));
+        }
         co_return Err(fmt::format("Chat request failed (HTTP {})", res.code()));
+    }
 
     auto parsed = matjson::parse(res.string().unwrapOr("{}"));
     if (!parsed)
@@ -212,11 +340,17 @@ static arc::Future<Result<FetchResult, std::string>> fetchChatMessages(
         co_return Err(fmt::format("YouTube API error: {}", msg));
     }
 
-    // Advance (or clear) the pagination cursor.
+    if (root.contains("pollingIntervalMillis")) {
+        if (auto ms = root["pollingIntervalMillis"].asInt()) {
+            out.suggestedPollIntervalMs = static_cast<uint64_t>(ms.unwrap());
+        }
+    }
+
+    // Advance (or update) the pagination cursor.
     if (root.contains("nextPageToken")) {
         if (auto tok = root["nextPageToken"].asString())
             pageToken = tok.unwrap();
-    } else {
+    } else if (isSync) {
         pageToken.clear();
     }
 
@@ -224,26 +358,94 @@ static arc::Future<Result<FetchResult, std::string>> fetchChatMessages(
         auto items = root["items"].asArray();
         if (items) {
             for (auto const& it : items.unwrap()) {
+                std::string itemId = it.contains("id") ? it["id"].asString().unwrapOr("") : "";
+
+                std::string type = "textMessageEvent";
+                if (it.contains("snippet") && it["snippet"].contains("type")) {
+                    type = it["snippet"]["type"].asString().unwrapOr("textMessageEvent");
+                }
+
+                // 1. Message deleted event
+                if (type == "messageDeletedEvent") {
+                    if (it.contains("snippet") && it["snippet"].contains("messageDeletedDetails")) {
+                        auto const& del = it["snippet"]["messageDeletedDetails"];
+                        if (del.contains("deletedMessageId")) {
+                            std::string delId = del["deletedMessageId"].asString().unwrapOr("");
+                            if (!delId.empty()) out.deletedMessageIds.push_back(delId);
+                        }
+                    }
+                    continue;
+                }
+
+                // 2. Message retracted event
+                if (type == "messageRetractedEvent") {
+                    if (it.contains("snippet") && it["snippet"].contains("messageRetractedDetails")) {
+                        auto const& ret = it["snippet"]["messageRetractedDetails"];
+                        if (ret.contains("retractedMessageId")) {
+                            std::string retId = ret["retractedMessageId"].asString().unwrapOr("");
+                            if (!retId.empty()) out.deletedMessageIds.push_back(retId);
+                        }
+                    }
+                    continue;
+                }
+
+                // 3. User banned / hidden event
+                if (type == "userBannedEvent") {
+                    if (it.contains("snippet") && it["snippet"].contains("userBannedDetails")) {
+                        auto const& ban = it["snippet"]["userBannedDetails"];
+                        if (ban.contains("bannedUserDetails")) {
+                            auto const& user = ban["bannedUserDetails"];
+                            if (user.contains("channelId")) {
+                                std::string chId = user["channelId"].asString().unwrapOr("");
+                                if (!chId.empty()) out.bannedChannelIds.push_back(chId);
+                            }
+                            if (user.contains("displayName")) {
+                                std::string name = user["displayName"].asString().unwrapOr("");
+                                if (!name.empty()) out.bannedUserNames.push_back(name);
+                            }
+                        }
+                    }
+                    continue;
+                }
+
+                // Standard message
                 ChatMessage msg;
-                if (it.contains("authorDetails") && it["authorDetails"].contains("displayName"))
-                    msg.author = it["authorDetails"]["displayName"].asString().unwrapOr("Viewer");
-                else
+                msg.id = itemId;
+
+                if (it.contains("authorDetails")) {
+                    auto const& auth = it["authorDetails"];
+                    if (auth.contains("displayName"))
+                        msg.author = auth["displayName"].asString().unwrapOr("Viewer");
+                    else
+                        msg.author = "Viewer";
+                    if (auth.contains("channelId"))
+                        msg.channelId = auth["channelId"].asString().unwrapOr("");
+                } else if (it.contains("snippet") && it["snippet"].contains("authorChannelId")) {
+                    msg.channelId = it["snippet"]["authorChannelId"].asString().unwrapOr("");
                     msg.author = "Viewer";
+                } else {
+                    msg.author = "Viewer";
+                }
+
                 if (it.contains("snippet") && it["snippet"].contains("displayMessage"))
                     msg.text = it["snippet"]["displayMessage"].asString().unwrapOr("");
+
                 if (msg.text.empty())
                     continue;
-                out.messages.push_back(std::move(msg));
+
+                out.activeMessageIds.push_back(msg.id);
+                out.newMessages.push_back(std::move(msg));
             }
         }
     }
 
-    out.status = out.messages.empty() ? "Connected - waiting for messages..." : "Connected";
+    out.status = (out.newMessages.empty() && !isSync) ? "Connected - waiting for messages..." : "Connected";
     co_return Ok(out);
 }
 
-static arc::Future<FetchResult> doFetch(Config const& cfg, std::string& chatId, std::string& pageToken) {
+static arc::Future<FetchResult> doFetch(Config const& cfg, std::string& chatId, std::string& pageToken, bool isSync) {
     FetchResult out;
+    out.isSync = isSync;
 
     // Resolve the active chat id on first run only (or if it changed).
     if (chatId.empty()) {
@@ -272,7 +474,7 @@ static arc::Future<FetchResult> doFetch(Config const& cfg, std::string& chatId, 
         co_return out;
     }
 
-    auto fetched = co_await fetchChatMessages(cfg, chatId, pageToken);
+    auto fetched = co_await fetchChatMessages(cfg, chatId, pageToken, isSync);
     if (!fetched) {
         out.status = fetched.unwrapErr();
         co_return out;
@@ -311,7 +513,7 @@ private:
     arc::Future<void> pollLoop();
 
     // Rendering ------------------------------------------------------------
-    void addMessages(std::vector<ChatMessage> const& messages);
+    void handleFetchResult(FetchResult const& f);
     CCNode* buildMessageRow(ChatMessage const& message);
     CCMenuItemSpriteExtra* buildIdItem(int levelID);
     void setStatus(std::string const& status);
@@ -323,12 +525,21 @@ private:
     void restoreLevelManagerDelegate();
 
     // Members ---------------------------------------------------------------
+    struct RowEntry {
+        CCNode* node = nullptr;
+        std::string messageId;
+        std::string author;
+        std::string channelId;
+    };
+
     CCLayerColor* m_bg      = nullptr;
     CCLabelBMFont* m_title  = nullptr;
     CCLabelBMFont* m_status = nullptr;
     CCNode* m_content       = nullptr;
 
-    std::vector<CCNode*> m_rows;   // newest at front
+    std::vector<RowEntry> m_rows;   // oldest at front (top), newest at back (bottom)
+    std::unordered_set<std::string> m_bannedChannelIds;
+    std::unordered_set<std::string> m_bannedUserNames;
 
     LevelManagerDelegate* m_prevManagerDelegate = nullptr;
 
@@ -402,6 +613,7 @@ void LiveyChatOverlay::stopPolling() {
 arc::Future<void> LiveyChatOverlay::pollLoop() {
     std::string chatId;     // resolved once per polling session
     std::string pageToken;
+    int pollCount = 0;
 
     while (true) {
         double delay = 5.0;
@@ -410,15 +622,24 @@ arc::Future<void> LiveyChatOverlay::pollLoop() {
             if (!cfg)
                 co_return;
 
-            auto fetch = co_await doFetch(*cfg, chatId, pageToken);
+            pollCount++;
+            // Every 4th poll, run a sync poll without pageToken to detect any messages
+            // deleted on YouTube that did not emit a deletion event.
+            bool isSync = (pollCount % 4 == 0);
+
+            auto fetch = co_await doFetch(*cfg, chatId, pageToken, isSync);
+
+            if (fetch.suggestedPollIntervalMs > 0) {
+                double suggestedSec = static_cast<double>(fetch.suggestedPollIntervalMs) / 1000.0;
+                delay = std::max(cfg->pollInterval, suggestedSec);
+            } else {
+                delay = cfg->pollInterval;
+            }
 
             co_await async::waitForMainThread<void>([this, f = std::move(fetch)]() mutable {
                 this->setStatus(f.status);
-                if (!f.messages.empty())
-                    this->addMessages(f.messages);
+                this->handleFetchResult(f);
             });
-
-            delay = cfg->pollInterval;
         }
         catch (std::exception const& e) {
             log::warn("LiveyChat poll error: {}", e.what());
@@ -482,70 +703,147 @@ void LiveyChatOverlay::restartPolling() {
 
 // --- Rendering -------------------------------------------------------------
 
-void LiveyChatOverlay::addMessages(std::vector<ChatMessage> const& messages) {
+void LiveyChatOverlay::handleFetchResult(FetchResult const& f) {
+    bool changed = false;
+
+    // 1. Remove deleted messages by message ID
+    for (auto const& delId : f.deletedMessageIds) {
+        auto it = std::find_if(m_rows.begin(), m_rows.end(), [&](RowEntry const& r) {
+            return !r.messageId.empty() && r.messageId == delId;
+        });
+        if (it != m_rows.end()) {
+            it->node->removeFromParentAndCleanup(true);
+            m_rows.erase(it);
+            changed = true;
+        }
+    }
+
+    // 2. Track banned / hidden users and immediately purge their messages
+    for (auto const& chId : f.bannedChannelIds) {
+        if (!chId.empty()) m_bannedChannelIds.insert(chId);
+    }
+    for (auto const& name : f.bannedUserNames) {
+        if (!name.empty()) m_bannedUserNames.insert(name);
+    }
+
+    if (!f.bannedChannelIds.empty() || !f.bannedUserNames.empty()) {
+        auto it = m_rows.begin();
+        while (it != m_rows.end()) {
+            bool isBanned = false;
+            if (!it->channelId.empty() && m_bannedChannelIds.count(it->channelId)) isBanned = true;
+            if (!it->author.empty() && m_bannedUserNames.count(it->author)) isBanned = true;
+            if (isBanned) {
+                it->node->removeFromParentAndCleanup(true);
+                it = m_rows.erase(it);
+                changed = true;
+            } else {
+                ++it;
+            }
+        }
+    }
+
+    // 3. Periodic sync: if an on-screen message was deleted on YouTube, it won't be in the active list
+    if (f.isSync && !f.activeMessageIds.empty() && !m_rows.empty()) {
+        std::unordered_set<std::string> activeSet(f.activeMessageIds.begin(), f.activeMessageIds.end());
+        auto it = m_rows.begin();
+        while (it != m_rows.end()) {
+            if (!it->messageId.empty() && !activeSet.count(it->messageId)) {
+                it->node->removeFromParentAndCleanup(true);
+                it = m_rows.erase(it);
+                changed = true;
+            } else {
+                ++it;
+            }
+        }
+    }
+
+    // 4. Add new messages
     int64_t maxRaw = Mod::get()->getSettingValue<int64_t>("max-messages");
     int maxMsgs = static_cast<int>(std::clamp<int64_t>(maxRaw, 1, 20));
 
-    for (auto const& message : messages) {
-        auto row = this->buildMessageRow(message);
-        m_content->addChild(row);
-        m_rows.insert(m_rows.begin(), row);
+    for (auto const& message : f.newMessages) {
+        // Drop messages from banned users
+        if (!message.channelId.empty() && m_bannedChannelIds.count(message.channelId)) continue;
+        if (!message.author.empty() && m_bannedUserNames.count(message.author)) continue;
+
+        // Prevent duplicate entries
+        if (!message.id.empty()) {
+            bool exists = std::any_of(m_rows.begin(), m_rows.end(), [&](RowEntry const& r) {
+                return r.messageId == message.id;
+            });
+            if (exists) continue;
+        }
+
+        auto* rowNode = this->buildMessageRow(message);
+        m_content->addChild(rowNode);
+        m_rows.push_back(RowEntry{ rowNode, message.id, message.author, message.channelId });
+        changed = true;
     }
 
+    // 5. Enforce max-messages (oldest at top are removed first)
     while (static_cast<int>(m_rows.size()) > maxMsgs) {
-        auto* last = m_rows.back();
-        m_rows.pop_back();
-        last->removeFromParentAndCleanup(true);
+        auto const& first = m_rows.front();
+        first.node->removeFromParentAndCleanup(true);
+        m_rows.erase(m_rows.begin());
+        changed = true;
     }
 
-    this->applyPosition();
+    if (changed) {
+        this->applyPosition();
+    }
 }
 
 CCNode* LiveyChatOverlay::buildMessageRow(ChatMessage const& message) {
     auto* row = CCNode::create();
     row->setAnchorPoint(ccp(0.0f, 1.0f));
 
-    // Author line.
-    auto* author = CCLabelBMFont::create((message.author + ":").c_str(), "chatFont.fnt");
-    author->setScale(0.45f);
-    author->setAnchorPoint(ccp(0.0f, 1.0f));
-    author->setColor(ccc3(150, 150, 150));
-    row->addChild(author);
-
-    float maxExtent = author->getContentSize().width * author->getScaleX();
-    float y = -(author->getContentSize().height * author->getScaleY() + 2.0f);
-
     auto* menu = CCMenu::create();
     menu->setAnchorPoint(ccp(0.0f, 1.0f));
     menu->setPosition(ccp(0.0f, 0.0f));
     row->addChild(menu);
 
-    // Flow layout: white words + green clickable level IDs, with word wrap.
     float x = 0.0f;
+    float y = 0.0f;
+    float maxExtent = 0.0f;
+
+    // 1. Author (colored according to username, Streamlabs Clean style: no colon)
+    float authorW = 0.0f, authorH = 0.0f;
+    ccColor3B authorColor = getAuthorColor(message.author);
+    auto* authorNode = createShadowedLabel(
+        message.author, "chatFont.fnt", 0.5f, authorColor, &authorW, &authorH, false
+    );
+    authorNode->setPosition(ccp(x, y));
+    row->addChild(authorNode);
+    x += authorW + kWordGap;
+    maxExtent = std::max(maxExtent, x);
+
+    // 2. Message tokens (clean white text, clickable green level IDs with realistic shadow)
     for (auto const& tok : tokenizeMessage(message.text)) {
         if (tok.isId) {
-            auto* item = this->buildIdItem(std::stoi(tok.text));
+            int levelID = 0;
+            try { levelID = std::stoi(tok.text); } catch (...) {}
+            auto* item = this->buildIdItem(levelID);
             float w = item->getContentSize().width;
+            float h = item->getContentSize().height;
             if (x > 0.0f && x + w > kTextWrapWidth) {
                 x = 0.0f;
                 y -= kLineHeight;
             }
-            item->setPosition(ccp(x + w / 2.0f, y - kLineHeight / 2.0f));
+            item->setPosition(ccp(x + w / 2.0f, y - h / 2.0f));
             menu->addChild(item);
             maxExtent = std::max(maxExtent, x + w);
             x += w + kWordGap;
         } else {
-            auto* lbl = CCLabelBMFont::create(tok.text.c_str(), "chatFont.fnt");
-            lbl->setScale(0.5f);
-            lbl->setAnchorPoint(ccp(0.0f, 1.0f));
-            lbl->setColor(ccc3(255, 255, 255));
-            float w = lbl->getContentSize().width * lbl->getScaleX();
+            float w = 0.0f, h = 0.0f;
+            auto* wordNode = createShadowedLabel(
+                tok.text, "chatFont.fnt", 0.5f, ccc3(255, 255, 255), &w, &h, false
+            );
             if (x > 0.0f && x + w > kTextWrapWidth) {
                 x = 0.0f;
                 y -= kLineHeight;
             }
-            lbl->setPosition(ccp(x, y));
-            row->addChild(lbl);
+            wordNode->setPosition(ccp(x, y));
+            row->addChild(wordNode);
             maxExtent = std::max(maxExtent, x + w);
             x += w + kWordGap;
         }
@@ -557,72 +855,101 @@ CCNode* LiveyChatOverlay::buildMessageRow(ChatMessage const& message) {
 }
 
 CCMenuItemSpriteExtra* LiveyChatOverlay::buildIdItem(int levelID) {
-    auto* label = CCLabelBMFont::create(std::to_string(levelID).c_str(), "chatFont.fnt");
-    label->setScale(0.5f);
-    label->setColor(ccc3(90, 230, 90));   // green => clickable
-
-    float w = label->getContentSize().width * label->getScaleX();
-    float h = label->getContentSize().height * label->getScaleY();
+    float w = 0.0f, h = 0.0f;
+    auto* labelNode = createShadowedLabel(
+        std::to_string(levelID), "chatFont.fnt", 0.5f, ccc3(90, 240, 90), &w, &h, true
+    );
 
     auto* item = CCMenuItemSpriteExtra::create(
-        label, this, menu_selector(LiveyChatOverlay::onLevelIDClicked));
+        labelNode, this, menu_selector(LiveyChatOverlay::onLevelIDClicked));
     item->setTag(levelID);
     item->setContentSize(CCSize(w, h));
     return item;
 }
 
 void LiveyChatOverlay::relayout() {
+    bool titleVisible  = m_title  && m_title->isVisible();
+    bool statusVisible = m_status && m_status->isVisible();
+    bool hasHeaders    = titleVisible || statusVisible;
+
+    // When all headers are disabled and there are no messages,
+    // collapse completely and hide the background (eliminates awkward empty box)
+    if (!hasHeaders && m_rows.empty()) {
+        this->setContentSize(CCSize(0.0f, 0.0f));
+        if (m_bg) {
+            m_bg->setVisible(false);
+            m_bg->setContentSize(CCSize(0.0f, 0.0f));
+        }
+        return;
+    }
+
+    if (m_bg) {
+        m_bg->setVisible(true);
+    }
+
+    // Streamlabs style: tight, clean vertical padding when headers are hidden
+    float padTop    = hasHeaders ? 6.0f : 4.0f;
+    float padBottom = hasHeaders ? 6.0f : 4.0f;
+    float padLeft   = hasHeaders ? 8.0f : 6.0f;
+    float padRight  = hasHeaders ? 8.0f : 6.0f;
+
     // Stack rows top-down and measure the widest one.
     float y = 0.0f;
     float maxRowW = 0.0f;
-    for (auto* row : m_rows) {
-        row->setPosition(ccp(kPad, y));
-        y -= row->getContentSize().height + kRowGap;
-        maxRowW = std::max(maxRowW, row->getContentSize().width);
+    for (auto const& entry : m_rows) {
+        entry.node->setPosition(ccp(padLeft, y));
+        y -= entry.node->getContentSize().height + kRowGap;
+        maxRowW = std::max(maxRowW, entry.node->getContentSize().width);
     }
     float contentH = m_rows.empty() ? 0.0f : (-y - kRowGap);
-
-    bool titleVisible  = m_title  && m_title->isVisible();
-    bool statusVisible = m_status && m_status->isVisible();
 
     float titleH  = titleVisible  ? m_title->getContentSize().height  * m_title->getScaleY()  : 0.0f;
     float titleW  = titleVisible  ? m_title->getContentSize().width   * m_title->getScaleX()  : 0.0f;
     float statusH = statusVisible ? m_status->getContentSize().height * m_status->getScaleY() : 0.0f;
     float statusW = statusVisible ? m_status->getContentSize().width  * m_status->getScaleX() : 0.0f;
 
-    // Shrink the panel to fit its content (with a max cap for wrapping).
+    float minW = hasHeaders ? kMinPanelWidth : (m_rows.empty() ? 0.0f : 40.0f);
     float panelW = std::clamp(
-        std::max({ maxRowW, titleW, statusW }) + 2.0f * kPad,
-        kMinPanelWidth, kMaxPanelWidth);
+        std::max({ maxRowW, titleW, statusW }) + padLeft + padRight,
+        minW, kMaxPanelWidth);
 
-    // Header height (only counts visible elements).
     float headerH = 0.0f;
-    if (titleVisible)  headerH += titleH  + 2.0f;
-    if (statusVisible) headerH += statusH + 4.0f;
+    if (titleVisible)  headerH += titleH;
+    if (titleVisible && statusVisible) headerH += 2.0f;
+    if (statusVisible) headerH += statusH;
+    if (hasHeaders && !m_rows.empty()) headerH += 4.0f;
 
-    float totalH = kPad + headerH + contentH + kPad;
+    float totalH = padTop + headerH + contentH + padBottom;
 
     this->setContentSize(CCSize(panelW, totalH));
     if (m_bg)
         m_bg->setContentSize(CCSize(panelW, totalH));
 
     // Position header elements from the top down.
-    float top = totalH - kPad;
+    float top = totalH - padTop;
     if (titleVisible) {
-        m_title->setPosition(ccp(kPad, top));
-        top -= titleH + 2.0f;
+        m_title->setPosition(ccp(padLeft, top));
+        top -= titleH;
+        if (statusVisible) top -= 2.0f;
     }
     if (statusVisible) {
-        m_status->setPosition(ccp(kPad, top));
-        top -= statusH + 4.0f;
+        m_status->setPosition(ccp(padLeft, top));
+        top -= statusH;
+    }
+    if (hasHeaders && !m_rows.empty()) {
+        top -= 4.0f;
     }
     if (m_content)
         m_content->setPosition(ccp(0.0f, top));
 }
 
 void LiveyChatOverlay::setStatus(std::string const& status) {
-    if (m_status)
+    if (m_status) {
         m_status->setString(status.c_str());
+        if (m_status->isVisible()) {
+            this->applyPosition();
+        }
+    }
 }
 
 // --- Callbacks -------------------------------------------------------------
