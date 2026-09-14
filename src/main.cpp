@@ -152,8 +152,6 @@ struct FetchResult {
     std::vector<std::string> deletedMessageIds;
     std::vector<std::string> bannedChannelIds;
     std::vector<std::string> bannedUserNames;
-    std::vector<std::string> activeMessageIds;
-    bool isSync = false;
     std::string status;     // short human-readable state ("Connected", errors…)
     uint64_t suggestedPollIntervalMs = 0;
 };
@@ -310,15 +308,14 @@ static arc::Future<Result<std::string, std::string>> resolveChatId(Config const&
 }
 
 static arc::Future<Result<FetchResult, std::string>> fetchChatMessages(
-    Config const& cfg, std::string const& chatId, std::string& pageToken, bool isSync)
+    Config const& cfg, std::string const& chatId, std::string& pageToken)
 {
     FetchResult out;
-    out.isSync = isSync;
 
     std::string url = fmt::format(
         "https://www.googleapis.com/youtube/v3/liveChat/messages?part=snippet,authorDetails&liveChatId={}&key={}",
         chatId, cfg.apiKey);
-    if (!isSync && !pageToken.empty())
+    if (!pageToken.empty())
         url += "&pageToken=" + pageToken;
 
     web::WebRequest req;
@@ -356,12 +353,10 @@ static arc::Future<Result<FetchResult, std::string>> fetchChatMessages(
         }
     }
 
-    // Advance (or update) the pagination cursor.
+    // Always advance pagination forward monotonically
     if (root.contains("nextPageToken")) {
         if (auto tok = root["nextPageToken"].asString())
             pageToken = tok.unwrap();
-    } else if (isSync) {
-        pageToken.clear();
     }
 
     if (root.contains("items") && root["items"].isArray()) {
@@ -443,19 +438,17 @@ static arc::Future<Result<FetchResult, std::string>> fetchChatMessages(
                 if (msg.text.empty())
                     continue;
 
-                out.activeMessageIds.push_back(msg.id);
                 out.newMessages.push_back(std::move(msg));
             }
         }
     }
 
-    out.status = (out.newMessages.empty() && !isSync) ? "Connected - waiting for messages..." : "Connected";
+    out.status = out.newMessages.empty() ? "Connected - waiting for messages..." : "Connected";
     co_return Ok(out);
 }
 
-static arc::Future<FetchResult> doFetch(Config const& cfg, std::string& chatId, std::string& pageToken, bool isSync) {
+static arc::Future<FetchResult> doFetch(Config const& cfg, std::string& chatId, std::string& pageToken) {
     FetchResult out;
-    out.isSync = isSync;
 
     // Resolve the active chat id on first run only (or if it changed).
     if (chatId.empty()) {
@@ -484,7 +477,7 @@ static arc::Future<FetchResult> doFetch(Config const& cfg, std::string& chatId, 
         co_return out;
     }
 
-    auto fetched = co_await fetchChatMessages(cfg, chatId, pageToken, isSync);
+    auto fetched = co_await fetchChatMessages(cfg, chatId, pageToken);
     if (!fetched) {
         out.status = fetched.unwrapErr();
         co_return out;
@@ -550,6 +543,7 @@ private:
     std::vector<RowEntry> m_rows;   // oldest at front (top), newest at back (bottom)
     std::unordered_set<std::string> m_bannedChannelIds;
     std::unordered_set<std::string> m_bannedUserNames;
+    std::unordered_set<std::string> m_seenMessageIds;
 
     LevelManagerDelegate* m_prevManagerDelegate = nullptr;
 
@@ -624,7 +618,6 @@ void LiveyChatOverlay::stopPolling() {
 arc::Future<void> LiveyChatOverlay::pollLoop() {
     std::string chatId;     // resolved once per polling session
     std::string pageToken;
-    int pollCount = 0;
 
     while (true) {
         double delay = 5.0;
@@ -633,12 +626,7 @@ arc::Future<void> LiveyChatOverlay::pollLoop() {
             if (!cfg)
                 co_return;
 
-            pollCount++;
-            // Every 4th poll, run a sync poll without pageToken to detect any messages
-            // deleted on YouTube that did not emit a deletion event.
-            bool isSync = (pollCount % 4 == 0);
-
-            auto fetch = co_await doFetch(*cfg, chatId, pageToken, isSync);
+            auto fetch = co_await doFetch(*cfg, chatId, pageToken);
 
             if (fetch.suggestedPollIntervalMs > 0) {
                 double suggestedSec = static_cast<double>(fetch.suggestedPollIntervalMs) / 1000.0;
@@ -727,6 +715,9 @@ void LiveyChatOverlay::handleFetchResult(FetchResult const& f) {
             m_rows.erase(it);
             changed = true;
         }
+        if (!delId.empty()) {
+            m_seenMessageIds.insert(delId);
+        }
     }
 
     // 2. Track banned / hidden users and immediately purge their messages
@@ -744,6 +735,7 @@ void LiveyChatOverlay::handleFetchResult(FetchResult const& f) {
             if (!it->channelId.empty() && m_bannedChannelIds.count(it->channelId)) isBanned = true;
             if (!it->author.empty() && m_bannedUserNames.count(it->author)) isBanned = true;
             if (isBanned) {
+                if (!it->messageId.empty()) m_seenMessageIds.insert(it->messageId);
                 it->node->removeFromParentAndCleanup(true);
                 it = m_rows.erase(it);
                 changed = true;
@@ -753,22 +745,7 @@ void LiveyChatOverlay::handleFetchResult(FetchResult const& f) {
         }
     }
 
-    // 3. Periodic sync: if an on-screen message was deleted on YouTube, it won't be in the active list
-    if (f.isSync && !f.activeMessageIds.empty() && !m_rows.empty()) {
-        std::unordered_set<std::string> activeSet(f.activeMessageIds.begin(), f.activeMessageIds.end());
-        auto it = m_rows.begin();
-        while (it != m_rows.end()) {
-            if (!it->messageId.empty() && !activeSet.count(it->messageId)) {
-                it->node->removeFromParentAndCleanup(true);
-                it = m_rows.erase(it);
-                changed = true;
-            } else {
-                ++it;
-            }
-        }
-    }
-
-    // 4. Add new messages
+    // 3. Add new messages (deduplicated against all previously seen messages)
     int64_t maxRaw = Mod::get()->getSettingValue<int64_t>("max-messages");
     int maxMsgs = static_cast<int>(std::clamp<int64_t>(maxRaw, 1, 20));
 
@@ -777,12 +754,10 @@ void LiveyChatOverlay::handleFetchResult(FetchResult const& f) {
         if (!message.channelId.empty() && m_bannedChannelIds.count(message.channelId)) continue;
         if (!message.author.empty() && m_bannedUserNames.count(message.author)) continue;
 
-        // Prevent duplicate entries
+        // Prevent duplicate or previously seen messages from ever re-appearing
         if (!message.id.empty()) {
-            bool exists = std::any_of(m_rows.begin(), m_rows.end(), [&](RowEntry const& r) {
-                return r.messageId == message.id;
-            });
-            if (exists) continue;
+            if (m_seenMessageIds.count(message.id)) continue;
+            m_seenMessageIds.insert(message.id);
         }
 
         auto* rowNode = this->buildMessageRow(message);
@@ -791,7 +766,7 @@ void LiveyChatOverlay::handleFetchResult(FetchResult const& f) {
         changed = true;
     }
 
-    // 5. Enforce max-messages (oldest at top are removed first)
+    // 4. Enforce max-messages (oldest at top are removed first)
     while (static_cast<int>(m_rows.size()) > maxMsgs) {
         auto const& first = m_rows.front();
         first.node->removeFromParentAndCleanup(true);
