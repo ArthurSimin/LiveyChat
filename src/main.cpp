@@ -27,12 +27,12 @@ using namespace geode::prelude;
 // ---------------------------------------------------------------------------
 
 // Overlay geometry ("points"). Width shrinks to fit content; height is dynamic.
-constexpr float kMaxPanelWidth = 400.0f;   // hard cap so very long messages wrap
+constexpr float kMaxPanelWidth = 360.0f;   // hard cap so very long messages wrap
 constexpr float kMinPanelWidth = 150.0f;
-constexpr float kTextWrapWidth = 360.0f;   // wrap width for message text
+constexpr float kTextWrapWidth = 320.0f;   // wrap width for message text
 constexpr float kPad           = 10.0f;    // outer padding (default when headers are visible)
-constexpr float kRowGap        = 4.0f;     // vertical gap between message rows
-constexpr float kLineHeight    = 14.0f;    // flow-layout line height
+constexpr float kRowGap        = 3.0f;     // vertical gap between message rows
+constexpr float kLineHeight    = 11.0f;    // flow-layout line height
 constexpr float kWordGap       = 4.0f;     // horizontal gap between words/IDs
 
 // Vibrant streamer username color palette (Twitch / Kick / Streamlabs style)
@@ -120,7 +120,7 @@ static CCNode* createShadowedLabel(
     if (isClickable) {
         container->setAnchorPoint(ccp(0.5f, 0.5f));
     } else {
-        container->setAnchorPoint(ccp(0.0f, 1.0f));
+        container->setAnchorPoint(ccp(0.0f, 0.0f));
     }
 
     if (outWidth) *outWidth = w;
@@ -170,17 +170,27 @@ struct Config {
 // Message tokenization (splits text into words + clickable level IDs)
 // ---------------------------------------------------------------------------
 
+enum class ChatTokenType { Word, LevelID, Newline };
+
 struct Token {
-    bool isId = false;
+    ChatTokenType type = ChatTokenType::Word;
     std::string text;
 };
 
 static void appendWords(std::vector<Token>& out, std::string const& chunk) {
     std::string cur;
     for (char c : chunk) {
-        if (c == ' ') {
+        if (c == '\r') {
+            continue;
+        } else if (c == '\n') {
             if (!cur.empty()) {
-                out.push_back(Token{false, cur});
+                out.push_back(Token{ChatTokenType::Word, cur});
+                cur.clear();
+            }
+            out.push_back(Token{ChatTokenType::Newline, "\n"});
+        } else if (c == ' ' || c == '\t') {
+            if (!cur.empty()) {
+                out.push_back(Token{ChatTokenType::Word, cur});
                 cur.clear();
             }
         } else {
@@ -188,7 +198,7 @@ static void appendWords(std::vector<Token>& out, std::string const& chunk) {
         }
     }
     if (!cur.empty())
-        out.push_back(Token{false, cur});
+        out.push_back(Token{ChatTokenType::Word, cur});
 }
 
 static std::string stripCommas(std::string const& s) {
@@ -216,13 +226,13 @@ static std::vector<Token> tokenizeMessage(std::string const& text) {
         if (stripped.size() >= 6) {
             try {
                 (void)std::stoi(stripped);   // out of int range => not a GD level ID
-                out.push_back(Token{true, stripped});
+                out.push_back(Token{ChatTokenType::LevelID, stripped});
             }
             catch (std::exception const&) {
-                out.push_back(Token{false, raw});
+                out.push_back(Token{ChatTokenType::Word, raw});
             }
         } else {
-            out.push_back(Token{false, raw});
+            out.push_back(Token{ChatTokenType::Word, raw});
         }
         pos = start + len;
     }
@@ -583,7 +593,8 @@ bool LiveyChatOverlay::init() {
     this->addChild(m_status);
 
     m_content = CCNode::create();
-    m_content->setAnchorPoint(ccp(0.0f, 1.0f));
+    m_content->ignoreAnchorPointForPosition(false);
+    m_content->setAnchorPoint(ccp(0.0f, 0.0f));
     this->addChild(m_content);
 
     this->applyOpacity();
@@ -794,17 +805,22 @@ void LiveyChatOverlay::handleFetchResult(FetchResult const& f) {
 }
 
 CCNode* LiveyChatOverlay::buildMessageRow(ChatMessage const& message) {
-    auto* row = CCNode::create();
-    row->setAnchorPoint(ccp(0.0f, 1.0f));
+    struct LineItem {
+        CCNode* node = nullptr;
+        bool isMenuItem = false;
+        float x = 0.0f;
+        float width = 0.0f;
+        float height = 0.0f;
+    };
 
-    auto* menu = CCMenu::create();
-    menu->setAnchorPoint(ccp(0.0f, 1.0f));
-    menu->setPosition(ccp(0.0f, 0.0f));
-    row->addChild(menu);
+    struct RowLine {
+        std::vector<LineItem> items;
+        float width = 0.0f;
+    };
 
-    float x = 0.0f;
-    float y = 0.0f;
-    float maxExtent = 0.0f;
+    std::vector<RowLine> lines;
+    RowLine currentLine;
+    float curX = 0.0f;
 
     // 1. Author (colored according to username, Streamlabs Clean style: no colon)
     float authorW = 0.0f, authorH = 0.0f;
@@ -812,45 +828,91 @@ CCNode* LiveyChatOverlay::buildMessageRow(ChatMessage const& message) {
     auto* authorNode = createShadowedLabel(
         message.author, "chatFont.fnt", 0.5f, authorColor, &authorW, &authorH, false
     );
-    authorNode->setPosition(ccp(x, y));
-    row->addChild(authorNode);
-    x += authorW + kWordGap;
-    maxExtent = std::max(maxExtent, x);
+    currentLine.items.push_back(LineItem{ authorNode, false, curX, authorW, authorH });
+    curX += authorW + kWordGap;
+    currentLine.width = curX;
 
     // 2. Message tokens (clean white text, clickable green level IDs with realistic shadow)
     for (auto const& tok : tokenizeMessage(message.text)) {
-        if (tok.isId) {
+        if (tok.type == ChatTokenType::Newline) {
+            lines.push_back(std::move(currentLine));
+            currentLine = RowLine{};
+            curX = 0.0f;
+            continue;
+        }
+
+        if (tok.type == ChatTokenType::LevelID) {
             int levelID = 0;
             try { levelID = std::stoi(tok.text); } catch (...) {}
             auto* item = this->buildIdItem(levelID);
             float w = item->getContentSize().width;
             float h = item->getContentSize().height;
-            if (x > 0.0f && x + w > kTextWrapWidth) {
-                x = 0.0f;
-                y -= kLineHeight;
+            if (curX > 0.0f && curX + w > kTextWrapWidth) {
+                lines.push_back(std::move(currentLine));
+                currentLine = RowLine{};
+                curX = 0.0f;
             }
-            item->setPosition(ccp(x + w / 2.0f, y - h / 2.0f));
-            menu->addChild(item);
-            maxExtent = std::max(maxExtent, x + w);
-            x += w + kWordGap;
+            currentLine.items.push_back(LineItem{ item, true, curX, w, h });
+            curX += w + kWordGap;
+            currentLine.width = curX;
         } else {
             float w = 0.0f, h = 0.0f;
             auto* wordNode = createShadowedLabel(
                 tok.text, "chatFont.fnt", 0.5f, ccc3(255, 255, 255), &w, &h, false
             );
-            if (x > 0.0f && x + w > kTextWrapWidth) {
-                x = 0.0f;
-                y -= kLineHeight;
+            if (curX > 0.0f && curX + w > kTextWrapWidth) {
+                lines.push_back(std::move(currentLine));
+                currentLine = RowLine{};
+                curX = 0.0f;
             }
-            wordNode->setPosition(ccp(x, y));
-            row->addChild(wordNode);
-            maxExtent = std::max(maxExtent, x + w);
-            x += w + kWordGap;
+            currentLine.items.push_back(LineItem{ wordNode, false, curX, w, h });
+            curX += w + kWordGap;
+            currentLine.width = curX;
         }
     }
 
-    float rowH = (-y) + kLineHeight;
-    row->setContentSize(CCSize(std::min(maxExtent, kTextWrapWidth), rowH));
+    if (!currentLine.items.empty()) {
+        lines.push_back(std::move(currentLine));
+    }
+
+    if (lines.empty()) {
+        lines.push_back(RowLine{});
+    }
+
+    size_t numLines = lines.size();
+    float rowH = static_cast<float>(numLines) * kLineHeight;
+    float maxExtent = 0.0f;
+    for (auto const& l : lines) {
+        maxExtent = std::max(maxExtent, l.width);
+    }
+    float rowW = std::min(maxExtent, kTextWrapWidth);
+
+    auto* row = CCNode::create();
+    row->ignoreAnchorPointForPosition(false);
+    row->setAnchorPoint(ccp(0.0f, 0.0f));
+    row->setContentSize(CCSize(rowW, rowH));
+
+    auto* menu = CCMenu::create();
+    menu->ignoreAnchorPointForPosition(false);
+    menu->setAnchorPoint(ccp(0.0f, 0.0f));
+    menu->setPosition(ccp(0.0f, 0.0f));
+    menu->setContentSize(CCSize(rowW, rowH));
+    row->addChild(menu);
+
+    for (size_t lineIdx = 0; lineIdx < numLines; ++lineIdx) {
+        // lineIdx 0 is top line; lineIdx (numLines - 1) is bottom line
+        float lineBottom = rowH - static_cast<float>(lineIdx + 1) * kLineHeight;
+        for (auto const& item : lines[lineIdx].items) {
+            if (item.isMenuItem) {
+                item.node->setPosition(ccp(item.x + item.width / 2.0f, lineBottom + item.height / 2.0f));
+                menu->addChild(item.node);
+            } else {
+                item.node->setPosition(ccp(item.x, lineBottom));
+                row->addChild(item.node);
+            }
+        }
+    }
+
     return row;
 }
 
@@ -893,15 +955,29 @@ void LiveyChatOverlay::relayout() {
     float padLeft   = hasHeaders ? 8.0f : 6.0f;
     float padRight  = hasHeaders ? 8.0f : 6.0f;
 
-    // Stack rows top-down and measure the widest one.
-    float y = 0.0f;
+    // Compute total content height dynamically based on each row's actual height
+    float contentH = 0.0f;
     float maxRowW = 0.0f;
-    for (auto const& entry : m_rows) {
-        entry.node->setPosition(ccp(padLeft, y));
-        y -= entry.node->getContentSize().height + kRowGap;
-        maxRowW = std::max(maxRowW, entry.node->getContentSize().width);
+    for (size_t i = 0; i < m_rows.size(); ++i) {
+        float rh = m_rows[i].node->getContentSize().height;
+        float rw = m_rows[i].node->getContentSize().width;
+        contentH += rh;
+        if (i + 1 < m_rows.size()) {
+            contentH += kRowGap;
+        }
+        maxRowW = std::max(maxRowW, rw);
     }
-    float contentH = m_rows.empty() ? 0.0f : (-y - kRowGap);
+
+    // Stack rows from top to bottom:
+    // m_rows[0] is oldest (at the top)
+    // m_rows.back() is newest (at the bottom)
+    float curY = contentH;
+    for (auto const& entry : m_rows) {
+        float rh = entry.node->getContentSize().height;
+        curY -= rh;
+        entry.node->setPosition(ccp(padLeft, curY));
+        curY -= kRowGap;
+    }
 
     float titleH  = titleVisible  ? m_title->getContentSize().height  * m_title->getScaleY()  : 0.0f;
     float titleW  = titleVisible  ? m_title->getContentSize().width   * m_title->getScaleX()  : 0.0f;
@@ -939,8 +1015,10 @@ void LiveyChatOverlay::relayout() {
     if (hasHeaders && !m_rows.empty()) {
         top -= 4.0f;
     }
-    if (m_content)
-        m_content->setPosition(ccp(0.0f, top));
+    if (m_content) {
+        m_content->setContentSize(CCSize(panelW, contentH));
+        m_content->setPosition(ccp(0.0f, top - contentH));
+    }
 }
 
 void LiveyChatOverlay::setStatus(std::string const& status) {
