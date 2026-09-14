@@ -29,7 +29,8 @@ clickable number that opens that level in-game.
 ---
 
   ## Preview
-  <img width="1600" height="900" alt="image" src="https://github.com/user-attachments/assets/7b1fd7a9-f2b7-4824-b840-829bf81ab38d" />
+<img width="1600" height="900" alt="image" src="https://github.com/user-attachments/assets/f100fba5-862b-42e9-aff6-a6a03045e12c" />
+
 
 
 ---
