@@ -14,6 +14,7 @@
 #include <Geode/binding/LevelManagerDelegate.hpp>
 
 #include <algorithm>
+#include <array>
 #include <cstdint>
 #include <regex>
 #include <string>
@@ -256,10 +257,54 @@ Config readConfig() {
 // YouTube Data API v3 helpers (coroutines, run off the main thread)
 // ---------------------------------------------------------------------------
 
+// Extracts a YouTube video ID from any common input form, so users can paste
+// whatever they have copied instead of trimming it manually:
+//   "dQw4w9WgXcQ"
+//   "https://www.youtube.com/watch?v=dQw4w9WgXcQ"
+//   "https://www.youtube.com/watch?v=dQw4w9WgXcQ&t=120s"
+//   "https://youtu.be/dQw4w9WgXcQ"
+//   "https://www.youtube.com/live/dQw4w9WgXcQ"
+static std::string extractVideoId(std::string input) {
+    // Trim surrounding whitespace.
+    size_t b = input.find_first_not_of(" \t\r\n");
+    if (b == std::string::npos) return "";
+    size_t e = input.find_last_not_of(" \t\r\n");
+    input = input.substr(b, e - b + 1);
+
+    // Bare ID: no URL characters present; return as-is.
+    if (input.find_first_of("/?&.=") == std::string::npos)
+        return input;
+
+    // "<anything>?v=ID" (watch URL, any host).
+    if (auto p = input.find("v="); p != std::string::npos) {
+        auto start = p + 2;
+        auto end = input.find_first_of("&# ", start);
+        return input.substr(start, end == std::string::npos ? std::string::npos : end - start);
+    }
+
+    // "youtu.be/ID", "/live/ID", "/shorts/ID", "/embed/ID".
+    const std::array<std::string_view, 4> prefixes = {
+        "youtu.be/", "/live/", "/shorts/", "/embed/"
+    };
+    for (auto pat : prefixes) {
+        if (auto p = input.find(pat); p != std::string::npos) {
+            auto start = p + pat.size();
+            auto end = input.find_first_of("&#? /", start);
+            return input.substr(start, end == std::string::npos ? std::string::npos : end - start);
+        }
+    }
+
+    return "";
+}
+
 static arc::Future<Result<std::string, std::string>> resolveChatId(Config const& cfg) {
+    auto videoId = extractVideoId(cfg.videoId);
+    if (videoId.empty())
+        co_return Err("Could not parse a video ID from that input. (ID like \"dQw4w9WgXcQ\" or a full YouTube link)");
+
     auto url = fmt::format(
         "https://www.googleapis.com/youtube/v3/videos?part=liveStreamingDetails&id={}&key={}",
-        cfg.videoId, cfg.apiKey);
+        videoId, cfg.apiKey);
 
     web::WebRequest req;
     auto res = co_await req.get(url);
@@ -298,8 +343,11 @@ static arc::Future<Result<std::string, std::string>> resolveChatId(Config const&
         co_return Err("That video is not a live stream.");
 
     auto const& details = item["liveStreamingDetails"];
-    if (!details.contains("activeLiveChatId"))
-        co_return Err("Live chat is not active for that stream.");
+    if (!details.contains("activeLiveChatId")) {
+        if (details.contains("actualEndTime"))
+            co_return Err("That stream has already ended (chat is only readable while live).");
+        co_return Err("Live chat is not active for that stream (it may have chat disabled).");
+    }
 
     auto id = details["activeLiveChatId"].asString();
     if (!id)
