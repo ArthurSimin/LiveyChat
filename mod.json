@@ -8,7 +8,7 @@
 	},
 	"id": "liveychat.youtube-chat",
 	"name": "LiveyChat",
-	"version": "v1.0.3",
+	"version": "v1.0.4",
 	"developer": "LiveyChat",
 	"description": "Displays live YouTube chat messages in-game, with clickable level IDs.",
 	"tags": ["online", "interface", "enhancement"],
@@ -34,20 +34,23 @@
 		"video-id": {
 			"type": "string",
 			"name": "YouTube Video ID",
-			"description": "The 11-character video ID of the live stream (e.g. dQw4w9WgXcQ).",
-			"default": ""
+			"description": "The video ID of the live stream, or a full YouTube link to it (both work).",
+			"default": "",
+			"filter": "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-._~:/?#[]@!$&'()*+,;=%"
 		},
 		"chat-id": {
 			"type": "string",
 			"name": "Live Chat ID (optional)",
 			"description": "A raw activeLiveChatId. Overrides Video ID when set.",
-			"default": ""
+			"default": "",
+			"filter": "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-._="
 		},
 		"api-key": {
 			"type": "string",
 			"name": "YouTube Data API Key",
 			"description": "A valid API key for the YouTube Data API v3 (required).",
-			"default": ""
+			"default": "",
+			"filter": "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_"
 		},
 		"position": {
 			"type": "string",
