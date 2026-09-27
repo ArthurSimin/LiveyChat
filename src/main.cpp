@@ -16,8 +16,11 @@
 #include <algorithm>
 #include <array>
 #include <cstdint>
+#include <deque>
+#include <optional>
 #include <regex>
 #include <string>
+#include <unordered_map>
 #include <unordered_set>
 #include <vector>
 
@@ -35,6 +38,10 @@ constexpr float kPad           = 10.0f;    // outer padding (default when header
 constexpr float kRowGap        = 3.0f;     // vertical gap between message rows
 constexpr float kLineHeight    = 11.0f;    // flow-layout line height
 constexpr float kWordGap       = 4.0f;     // horizontal gap between words/IDs
+constexpr float kScrollDuration = 0.24f;
+
+static constexpr ccColor3B kValidLevelColor   = { 90, 240, 90 };
+static constexpr ccColor3B kInvalidLevelColor = { 155, 155, 155 };
 
 // Vibrant streamer username color palette (Twitch / Kick / Streamlabs style)
 static const ccColor3B kStreamerColors[] = {
@@ -90,7 +97,9 @@ static CCNode* createShadowedLabel(
     ccColor3B color,
     float* outWidth = nullptr,
     float* outHeight = nullptr,
-    bool isClickable = false
+    bool isClickable = false,
+    std::vector<CCLabelBMFont*>* outFadeLabels = nullptr,
+    CCLabelBMFont** outBaseLabel = nullptr
 ) {
     auto* container = CCNode::create();
     container->ignoreAnchorPointForPosition(false);
@@ -104,6 +113,7 @@ static CCNode* createShadowedLabel(
         shadow->setAnchorPoint(ccp(0.0f, 0.0f));
         shadow->setPosition(ccp(tap.dx, tap.dy));
         container->addChild(shadow);
+        if (outFadeLabels) outFadeLabels->push_back(shadow);
     }
 
     // Main text label (clean, crisp, natural font weight - no artificial bold)
@@ -113,6 +123,8 @@ static CCNode* createShadowedLabel(
     base->setAnchorPoint(ccp(0.0f, 0.0f));
     base->setPosition(ccp(0.0f, 0.0f));
     container->addChild(base);
+    if (outFadeLabels) outFadeLabels->push_back(base);
+    if (outBaseLabel) *outBaseLabel = base;
 
     float w = base->getContentSize().width * scale;
     float h = base->getContentSize().height * scale;
@@ -146,13 +158,19 @@ struct ChatMessage {
     std::string author;
     std::string channelId;
     std::string text;
+    std::string publishedAt;
+};
+
+struct UserBanEvent {
+    std::string channelId;
+    std::string userName;
+    std::string publishedAt;
 };
 
 struct FetchResult {
     std::vector<ChatMessage> newMessages;
     std::vector<std::string> deletedMessageIds;
-    std::vector<std::string> bannedChannelIds;
-    std::vector<std::string> bannedUserNames;
+    std::vector<UserBanEvent> bannedUsers;
     std::string status;     // short human-readable state ("Connected", errors…)
     uint64_t suggestedPollIntervalMs = 0;
 };
@@ -446,17 +464,18 @@ static arc::Future<Result<FetchResult, std::string>> fetchChatMessages(
                 if (type == "userBannedEvent") {
                     if (it.contains("snippet") && it["snippet"].contains("userBannedDetails")) {
                         auto const& ban = it["snippet"]["userBannedDetails"];
+                        UserBanEvent banEvent;
+                        if (it.contains("snippet") && it["snippet"].contains("publishedAt"))
+                            banEvent.publishedAt = it["snippet"]["publishedAt"].asString().unwrapOr("");
                         if (ban.contains("bannedUserDetails")) {
                             auto const& user = ban["bannedUserDetails"];
-                            if (user.contains("channelId")) {
-                                std::string chId = user["channelId"].asString().unwrapOr("");
-                                if (!chId.empty()) out.bannedChannelIds.push_back(chId);
-                            }
-                            if (user.contains("displayName")) {
-                                std::string name = user["displayName"].asString().unwrapOr("");
-                                if (!name.empty()) out.bannedUserNames.push_back(name);
-                            }
+                            if (user.contains("channelId"))
+                                banEvent.channelId = user["channelId"].asString().unwrapOr("");
+                            if (user.contains("displayName"))
+                                banEvent.userName = user["displayName"].asString().unwrapOr("");
                         }
+                        if (!banEvent.channelId.empty() || !banEvent.userName.empty())
+                            out.bannedUsers.push_back(std::move(banEvent));
                     }
                     continue;
                 }
@@ -464,6 +483,8 @@ static arc::Future<Result<FetchResult, std::string>> fetchChatMessages(
                 // Standard message
                 ChatMessage msg;
                 msg.id = itemId;
+                if (it.contains("snippet") && it["snippet"].contains("publishedAt"))
+                    msg.publishedAt = it["snippet"]["publishedAt"].asString().unwrapOr("");
 
                 if (it.contains("authorDetails")) {
                     auto const& auth = it["authorDetails"];
@@ -565,15 +586,32 @@ private:
 
     // Rendering ------------------------------------------------------------
     void handleFetchResult(FetchResult const& f);
-    CCNode* buildMessageRow(ChatMessage const& message);
-    CCMenuItemSpriteExtra* buildIdItem(int levelID);
+    struct LevelLabelEntry {
+        int levelID = 0;
+        CCLabelBMFont* label = nullptr;
+    };
+    CCNode* buildMessageRow(
+        ChatMessage const& message,
+        std::vector<CCLabelBMFont*>& fadeLabels,
+        std::vector<LevelLabelEntry>& levelLabels);
+    CCMenuItemSpriteExtra* buildIdItem(
+        int levelID,
+        std::vector<CCLabelBMFont*>& fadeLabels,
+        std::vector<LevelLabelEntry>& levelLabels);
     void setStatus(std::string const& status);
+    void queueLevelValidation(int levelID);
+    void setLevelValidation(int levelID, bool valid);
+    void startNextLevelRequest();
+    void finishLevelRequest();
+    void removeAnimatedRow(CCNode* node);
 
     // Callbacks ------------------------------------------------------------
     void onLevelIDClicked(CCObject* sender);
     void openLevel(int levelID);
     void handleLevelsLoaded(cocos2d::CCArray* levels);
+    void handleLevelsFailed();
     void restoreLevelManagerDelegate();
+    void requestLevel(int levelID, bool withGameVersionFilter);
 
     // Members ---------------------------------------------------------------
     struct RowEntry {
@@ -581,6 +619,15 @@ private:
         std::string messageId;
         std::string author;
         std::string channelId;
+        std::vector<CCLabelBMFont*> fadeLabels;
+        std::vector<LevelLabelEntry> levelLabels;
+        bool isNew = false;
+    };
+
+    struct LevelRequest {
+        int levelID = 0;
+        bool openLevelWhenLoaded = false;
+        bool withGameVersionFilter = true;
     };
 
     CCLayerColor* m_bg      = nullptr;
@@ -589,9 +636,14 @@ private:
     CCNode* m_content       = nullptr;
 
     std::vector<RowEntry> m_rows;   // oldest at front (top), newest at back (bottom)
-    std::unordered_set<std::string> m_bannedChannelIds;
-    std::unordered_set<std::string> m_bannedUserNames;
+    std::unordered_map<std::string, std::string> m_bannedChannelIds;
+    std::unordered_map<std::string, std::string> m_bannedUserNames;
     std::unordered_set<std::string> m_seenMessageIds;
+    std::unordered_map<int, bool> m_levelIdValid;
+    std::unordered_set<int> m_queuedLevelValidations;
+    std::deque<LevelRequest> m_levelRequestQueue;
+    std::optional<LevelRequest> m_activeLevelRequest;
+    bool m_animateRowsOnRelayout = false;
 
     LevelManagerDelegate* m_prevManagerDelegate = nullptr;
 
@@ -752,6 +804,7 @@ void LiveyChatOverlay::restartPolling() {
 
 void LiveyChatOverlay::handleFetchResult(FetchResult const& f) {
     bool changed = false;
+    std::vector<RowEntry> rowsToAnimateOut;
 
     // 1. Remove deleted messages by message ID
     for (auto const& delId : f.deletedMessageIds) {
@@ -768,15 +821,13 @@ void LiveyChatOverlay::handleFetchResult(FetchResult const& f) {
         }
     }
 
-    // 2. Track banned / hidden users and immediately purge their messages
-    for (auto const& chId : f.bannedChannelIds) {
-        if (!chId.empty()) m_bannedChannelIds.insert(chId);
-    }
-    for (auto const& name : f.bannedUserNames) {
-        if (!name.empty()) m_bannedUserNames.insert(name);
+    // 2. Remember ban events and immediately purge the user's visible messages.
+    for (auto const& ban : f.bannedUsers) {
+        if (!ban.channelId.empty()) m_bannedChannelIds[ban.channelId] = ban.publishedAt;
+        if (!ban.userName.empty()) m_bannedUserNames[ban.userName] = ban.publishedAt;
     }
 
-    if (!f.bannedChannelIds.empty() || !f.bannedUserNames.empty()) {
+    if (!f.bannedUsers.empty()) {
         auto it = m_rows.begin();
         while (it != m_rows.end()) {
             bool isBanned = false;
@@ -798,9 +849,24 @@ void LiveyChatOverlay::handleFetchResult(FetchResult const& f) {
     int maxMsgs = static_cast<int>(std::clamp<int64_t>(maxRaw, 1, 20));
 
     for (auto const& message : f.newMessages) {
-        // Drop messages from banned users
-        if (!message.channelId.empty() && m_bannedChannelIds.count(message.channelId)) continue;
-        if (!message.author.empty() && m_bannedUserNames.count(message.author)) continue;
+        // An incoming message newer than its ban event means the user is
+        // allowed to post again. This also clears stale mute state for users
+        // unmuted by a moderator or Nightbot.
+        auto isStillBanned = [&](auto& bannedUsers, std::string const& key) {
+            if (key.empty()) return false;
+            auto it = bannedUsers.find(key);
+            if (it == bannedUsers.end()) return false;
+            if (message.publishedAt.empty() || it->second.empty() || message.publishedAt >= it->second) {
+                bannedUsers.erase(it);
+                return false;
+            }
+            return true;
+        };
+        bool bannedByChannel = isStillBanned(m_bannedChannelIds, message.channelId);
+        bool bannedByName = isStillBanned(m_bannedUserNames, message.author);
+        if (bannedByChannel || bannedByName) {
+            continue;
+        }
 
         // Prevent duplicate or previously seen messages from ever re-appearing
         if (!message.id.empty()) {
@@ -808,26 +874,59 @@ void LiveyChatOverlay::handleFetchResult(FetchResult const& f) {
             m_seenMessageIds.insert(message.id);
         }
 
-        auto* rowNode = this->buildMessageRow(message);
+        std::vector<CCLabelBMFont*> fadeLabels;
+        std::vector<LevelLabelEntry> levelLabels;
+        auto* rowNode = this->buildMessageRow(message, fadeLabels, levelLabels);
         m_content->addChild(rowNode);
-        m_rows.push_back(RowEntry{ rowNode, message.id, message.author, message.channelId });
+        RowEntry row;
+        row.node = rowNode;
+        row.messageId = message.id;
+        row.author = message.author;
+        row.channelId = message.channelId;
+        row.fadeLabels = std::move(fadeLabels);
+        row.levelLabels = std::move(levelLabels);
+        row.isNew = true;
+        m_rows.push_back(std::move(row));
         changed = true;
     }
 
     // 4. Enforce max-messages (oldest at top are removed first)
     while (static_cast<int>(m_rows.size()) > maxMsgs) {
-        auto const& first = m_rows.front();
-        first.node->removeFromParentAndCleanup(true);
+        auto oldest = std::move(m_rows.front());
         m_rows.erase(m_rows.begin());
+        if (oldest.isNew) {
+            oldest.node->removeFromParentAndCleanup(true);
+        } else {
+            rowsToAnimateOut.push_back(std::move(oldest));
+        }
         changed = true;
     }
 
     if (changed) {
+        m_animateRowsOnRelayout = !rowsToAnimateOut.empty();
         this->applyPosition();
     }
+
+    for (auto& row : rowsToAnimateOut) {
+        if (!row.node || !row.node->getParent()) continue;
+        float exitDistance = row.node->getContentSize().height + kRowGap;
+        auto* moveAndRemove = CCSequence::create(
+            CCEaseSineOut::create(CCMoveBy::create(kScrollDuration, ccp(0.0f, exitDistance))),
+            CCCallFuncN::create(this, callfuncN_selector(LiveyChatOverlay::removeAnimatedRow)),
+            nullptr);
+        row.node->runAction(moveAndRemove);
+        for (auto* label : row.fadeLabels) {
+            if (label) label->runAction(CCFadeOut::create(kScrollDuration));
+        }
+    }
+
+    this->startNextLevelRequest();
 }
 
-CCNode* LiveyChatOverlay::buildMessageRow(ChatMessage const& message) {
+CCNode* LiveyChatOverlay::buildMessageRow(
+    ChatMessage const& message,
+    std::vector<CCLabelBMFont*>& fadeLabels,
+    std::vector<LevelLabelEntry>& levelLabels) {
     struct LineItem {
         CCNode* node = nullptr;
         bool isMenuItem = false;
@@ -849,7 +948,8 @@ CCNode* LiveyChatOverlay::buildMessageRow(ChatMessage const& message) {
     float authorW = 0.0f, authorH = 0.0f;
     ccColor3B authorColor = getAuthorColor(message.author);
     auto* authorNode = createShadowedLabel(
-        message.author, "chatFont.fnt", 0.5f, authorColor, &authorW, &authorH, false
+        message.author, "chatFont.fnt", 0.5f, authorColor, &authorW, &authorH, false,
+        &fadeLabels
     );
     currentLine.items.push_back(LineItem{ authorNode, false, curX, authorW, authorH });
     curX += authorW + kWordGap;
@@ -867,7 +967,7 @@ CCNode* LiveyChatOverlay::buildMessageRow(ChatMessage const& message) {
         if (tok.type == ChatTokenType::LevelID) {
             int levelID = 0;
             try { levelID = std::stoi(tok.text); } catch (...) {}
-            auto* item = this->buildIdItem(levelID);
+            auto* item = this->buildIdItem(levelID, fadeLabels, levelLabels);
             float w = item->getContentSize().width;
             float h = item->getContentSize().height;
             if (curX > 0.0f && curX + w > kTextWrapWidth) {
@@ -881,7 +981,8 @@ CCNode* LiveyChatOverlay::buildMessageRow(ChatMessage const& message) {
         } else {
             float w = 0.0f, h = 0.0f;
             auto* wordNode = createShadowedLabel(
-                tok.text, "chatFont.fnt", 0.5f, ccc3(255, 255, 255), &w, &h, false
+                tok.text, "chatFont.fnt", 0.5f, ccc3(255, 255, 255), &w, &h, false,
+                &fadeLabels
             );
             if (curX > 0.0f && curX + w > kTextWrapWidth) {
                 lines.push_back(std::move(currentLine));
@@ -939,11 +1040,22 @@ CCNode* LiveyChatOverlay::buildMessageRow(ChatMessage const& message) {
     return row;
 }
 
-CCMenuItemSpriteExtra* LiveyChatOverlay::buildIdItem(int levelID) {
+CCMenuItemSpriteExtra* LiveyChatOverlay::buildIdItem(
+    int levelID,
+    std::vector<CCLabelBMFont*>& fadeLabels,
+    std::vector<LevelLabelEntry>& levelLabels) {
     float w = 0.0f, h = 0.0f;
+    CCLabelBMFont* baseLabel = nullptr;
+    ccColor3B color = kInvalidLevelColor;
+    if (auto it = m_levelIdValid.find(levelID); it != m_levelIdValid.end() && it->second)
+        color = kValidLevelColor;
+
     auto* labelNode = createShadowedLabel(
-        std::to_string(levelID), "chatFont.fnt", 0.5f, ccc3(90, 240, 90), &w, &h, true
+        std::to_string(levelID), "chatFont.fnt", 0.5f, color, &w, &h, true,
+        &fadeLabels, &baseLabel
     );
+    levelLabels.push_back(LevelLabelEntry{ levelID, baseLabel });
+    this->queueLevelValidation(levelID);
 
     auto* item = CCMenuItemSpriteExtra::create(
         labelNode, this, menu_selector(LiveyChatOverlay::onLevelIDClicked));
@@ -965,6 +1077,7 @@ void LiveyChatOverlay::relayout() {
             m_bg->setVisible(false);
             m_bg->setContentSize(CCSize(0.0f, 0.0f));
         }
+        m_animateRowsOnRelayout = false;
         return;
     }
 
@@ -995,12 +1108,21 @@ void LiveyChatOverlay::relayout() {
     // m_rows[0] is oldest (at the top)
     // m_rows.back() is newest (at the bottom)
     float curY = contentH;
-    for (auto const& entry : m_rows) {
+    for (auto& entry : m_rows) {
         float rh = entry.node->getContentSize().height;
         curY -= rh;
-        entry.node->setPosition(ccp(padLeft, curY));
+        CCPoint target = ccp(padLeft, curY);
+        if (m_animateRowsOnRelayout && !entry.isNew) {
+            entry.node->stopAllActions();
+            entry.node->runAction(CCEaseSineOut::create(
+                CCMoveTo::create(kScrollDuration, target)));
+        } else {
+            entry.node->setPosition(target);
+        }
+        entry.isNew = false;
         curY -= kRowGap;
     }
+    m_animateRowsOnRelayout = false;
 
     float titleH  = titleVisible  ? m_title->getContentSize().height  * m_title->getScaleY()  : 0.0f;
     float titleW  = titleVisible  ? m_title->getContentSize().width   * m_title->getScaleX()  : 0.0f;
@@ -1060,35 +1182,96 @@ void LiveyChatOverlay::onLevelIDClicked(CCObject* sender) {
     this->openLevel(levelID);
 }
 
-void LiveyChatOverlay::openLevel(int levelID) {
+void LiveyChatOverlay::queueLevelValidation(int levelID) {
+    if (m_levelIdValid.contains(levelID)) return;
+    if (!m_queuedLevelValidations.insert(levelID).second) return;
+    m_levelRequestQueue.push_back(LevelRequest{ levelID, false, true });
+}
+
+void LiveyChatOverlay::setLevelValidation(int levelID, bool valid) {
+    m_levelIdValid[levelID] = valid;
+    m_queuedLevelValidations.erase(levelID);
+    m_levelRequestQueue.erase(
+        std::remove_if(m_levelRequestQueue.begin(), m_levelRequestQueue.end(), [&](LevelRequest const& request) {
+            return request.levelID == levelID && !request.openLevelWhenLoaded;
+        }),
+        m_levelRequestQueue.end());
+
+    ccColor3B color = valid ? kValidLevelColor : kInvalidLevelColor;
+    for (auto const& row : m_rows) {
+        for (auto const& entry : row.levelLabels) {
+            if (entry.levelID == levelID && entry.label)
+                entry.label->setColor(color);
+        }
+    }
+}
+
+void LiveyChatOverlay::startNextLevelRequest() {
+    if (m_activeLevelRequest || m_levelRequestQueue.empty()) return;
+
+    m_activeLevelRequest = m_levelRequestQueue.front();
+    m_levelRequestQueue.pop_front();
+
     auto glm = GameLevelManager::sharedState();
     m_prevManagerDelegate = glm->m_levelManagerDelegate;
     glm->m_levelManagerDelegate = this;
+    this->requestLevel(m_activeLevelRequest->levelID,
+                       m_activeLevelRequest->withGameVersionFilter);
+}
 
-    // Fetch the level's metadata (name, creator, difficulty, ...) before
-    // opening its page, so the info screen isn't blank. `gameVersion=22` forces
-    // GD 2.2 level data format (same as Geode's own markdown level links).
-    auto search = GJSearchObject::create(
-        SearchType::Type19, std::to_string(levelID) + "&gameVersion=22");
+void LiveyChatOverlay::finishLevelRequest() {
+    this->restoreLevelManagerDelegate();
+    m_activeLevelRequest.reset();
+    this->startNextLevelRequest();
+}
+
+void LiveyChatOverlay::openLevel(int levelID) {
+    // Put user clicks ahead of background validation requests.
+    m_levelRequestQueue.push_front(LevelRequest{ levelID, true, true });
+    this->startNextLevelRequest();
+}
+
+void LiveyChatOverlay::requestLevel(int levelID, bool withGameVersionFilter) {
+    auto glm = GameLevelManager::sharedState();
+    std::string query = std::to_string(levelID);
+    if (withGameVersionFilter)
+        query += "&gameVersion=22";
+
+    auto search = GJSearchObject::create(SearchType::Type19, query);
     glm->getOnlineLevels(search);
 }
 
 void LiveyChatOverlay::restoreLevelManagerDelegate() {
     auto glm = GameLevelManager::sharedState();
-    glm->m_levelManagerDelegate = m_prevManagerDelegate;
+    if (glm->m_levelManagerDelegate == this)
+        glm->m_levelManagerDelegate = m_prevManagerDelegate;
     m_prevManagerDelegate = nullptr;
 }
 
 void LiveyChatOverlay::handleLevelsLoaded(cocos2d::CCArray* levels) {
-    this->restoreLevelManagerDelegate();
+    if (!m_activeLevelRequest) return;
 
     if (levels && levels->count() > 0) {
-        auto* level = static_cast<GJGameLevel*>(levels->objectAtIndex(0));
-        auto* scene = LevelInfoLayer::scene(level, false);
-        CCDirector::sharedDirector()->pushScene(scene);
-    } else {
-        log::warn("LiveyChat: level not found");
+        if (m_activeLevelRequest->openLevelWhenLoaded) {
+            auto* level = static_cast<GJGameLevel*>(levels->objectAtIndex(0));
+            auto* scene = LevelInfoLayer::scene(level, false);
+            CCDirector::sharedDirector()->pushScene(scene);
+        }
+        this->setLevelValidation(m_activeLevelRequest->levelID, true);
+        this->finishLevelRequest();
+        return;
     }
+
+    if (m_activeLevelRequest->withGameVersionFilter) {
+        m_activeLevelRequest->withGameVersionFilter = false;
+        this->requestLevel(m_activeLevelRequest->levelID, false);
+        return;
+    }
+
+    if (m_activeLevelRequest->openLevelWhenLoaded)
+        log::warn("LiveyChat: level {} was not found", m_activeLevelRequest->levelID);
+    this->setLevelValidation(m_activeLevelRequest->levelID, false);
+    this->finishLevelRequest();
 }
 
 void LiveyChatOverlay::loadLevelsFinished(cocos2d::CCArray* levels, char const* key) {
@@ -1096,7 +1279,7 @@ void LiveyChatOverlay::loadLevelsFinished(cocos2d::CCArray* levels, char const* 
 }
 
 void LiveyChatOverlay::loadLevelsFailed(char const* key) {
-    this->restoreLevelManagerDelegate();
+    this->handleLevelsFailed();
 }
 
 void LiveyChatOverlay::loadLevelsFinished(cocos2d::CCArray* levels, char const* key, int type) {
@@ -1104,7 +1287,26 @@ void LiveyChatOverlay::loadLevelsFinished(cocos2d::CCArray* levels, char const* 
 }
 
 void LiveyChatOverlay::loadLevelsFailed(char const* key, int type) {
-    this->restoreLevelManagerDelegate();
+    this->handleLevelsFailed();
+}
+
+void LiveyChatOverlay::handleLevelsFailed() {
+    if (!m_activeLevelRequest) return;
+    if (m_activeLevelRequest->withGameVersionFilter) {
+        m_activeLevelRequest->withGameVersionFilter = false;
+        this->requestLevel(m_activeLevelRequest->levelID, false);
+        return;
+    }
+
+    if (m_activeLevelRequest->openLevelWhenLoaded)
+        log::warn("LiveyChat: failed to load level {}", m_activeLevelRequest->levelID);
+    this->setLevelValidation(m_activeLevelRequest->levelID, false);
+    this->finishLevelRequest();
+}
+
+void LiveyChatOverlay::removeAnimatedRow(CCNode* node) {
+    if (node && node->getParent() == m_content)
+        node->removeFromParentAndCleanup(true);
 }
 
 // ---------------------------------------------------------------------------

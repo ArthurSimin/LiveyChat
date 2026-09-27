@@ -2,8 +2,9 @@
 
 LiveyChat is a [Geode](https://geode-sdk.org/) mod for Geometry Dash that
 displays a YouTube live stream's chat directly inside the game. When someone
-mentions a Geometry Dash level ID in chat, LiveyChat turns it into a green,
-clickable number that opens that level in-game.
+mentions a Geometry Dash level ID in chat, LiveyChat checks it against the
+level service: working IDs turn green, and IDs that do not resolve stay gray.
+Clicking an ID opens its level page in-game.
 
 ---
 
@@ -15,13 +16,18 @@ clickable number that opens that level in-game.
   numbers (`148812853`) as well as comma-separated numbers that people use to
   get around chat filters (`146,175,134` or `1,4,6,1,7,5,1,3,4`). The commas
   are stripped and the number becomes clickable.
-- **Click-to-open** - clicking a green level ID opens that level's page in
-  Geometry Dash.
+- **Click-to-open** - clicking a valid (green) level ID opens that level's
+  page in Geometry Dash.
+- **Level-ID validation** - each distinct ID is checked once; failed lookups
+  stay gray, and lookups retry without the game-version filter to support
+  unlisted and older levels.
 - **Fully asynchronous** - chat fetching runs off the game thread, so nothing
   freezes. Requests are rate-limited with a configurable poll interval.
 - **Configurable overlay** - toggle it on/off, change its position, adjust the
   background opacity, cap the number of visible messages, hide the title or the
   status line.
+- **Animated scrolling** - when the message limit is reached, the top row
+  slides up and fades while the other rows move into place.
 - **Clear status and error messages** - the overlay tells you when it is
   connected, waiting, or what exactly is wrong (missing key, not a live stream,
   live chat disabled, etc.).
@@ -116,9 +122,9 @@ settings. The available settings are:
 2. Turn on **Enabled**.
 3. The overlay appears and its status line changes to `Connected` once the live
    chat is resolved.
-4. New messages scroll in. Any message that contains a level ID shows that
-   number in green.
-5. Click a green number to open that level's page.
+4. New messages scroll in. A detected ID starts gray and turns green if it
+   resolves to a level; IDs that do not resolve remain gray.
+5. Click a level ID to open its page.
 
 ---
 
@@ -168,10 +174,13 @@ installed automatically if a Geode profile is configured.
   thread.
 - **Rendering** uses a cocos2d `CCLayer` added to Geode's `OverlayManager`, so
   it persists across every scene. Messages are laid out as word-wrapped text,
-  and detected IDs are individual `CCMenuItemSpriteExtra` nodes.
+  detected IDs are individual `CCMenuItemSpriteExtra` nodes, and the oldest
+  visible message slides up and fades when a new message pushes it off screen.
 - **Level detection** uses a regex, strips commas, and validates the result is
-  a 6+ digit number that fits in an int. Clicking an ID fetches the level's
-  metadata first, then opens its page.
+  a 6+ digit number that fits in an int. Each ID is checked with the game's
+  level lookup; if the 2.2-filtered lookup fails, LiveyChat retries without
+  that filter before marking the ID invalid. Clicking an ID fetches the
+  level's metadata first, then opens its page.
 
 ---
 
