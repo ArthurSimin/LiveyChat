@@ -8,8 +8,9 @@
 	},
 	"id": "liveychat.youtube-chat",
 	"name": "LiveyChat",
-	"version": "v1.1.8",
+	"version": "v1.1.9",
 	"developer": "Simin",
+	"repository": "https://github.com/ArthurSimin/LiveyChat",
 	"description": "Displays live YouTube chat messages in-game, with clickable level IDs.",
 	"tags": ["online", "interface", "enhancement"],
 	"settings": {
