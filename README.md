@@ -3,8 +3,8 @@
 LiveyChat is a [Geode](https://geode-sdk.org/) mod for Geometry Dash that
 displays a YouTube live stream's chat directly inside the game. When someone
 mentions a Geometry Dash level ID in chat, LiveyChat checks it against the
-level service: working IDs turn green, and IDs that do not resolve stay gray.
-Clicking an ID opens its level page in-game.
+level service: valid IDs show the level name, while IDs that do not resolve
+stay as gray numbers. Clicking a valid name opens its level page in-game.
 
 ---
 
@@ -16,11 +16,10 @@ Clicking an ID opens its level page in-game.
   numbers (`148812853`) as well as comma-separated numbers that people use to
   get around chat filters (`146,175,134` or `1,4,6,1,7,5,1,3,4`). The commas
   are stripped and the number becomes clickable.
-- **Click-to-open** - clicking a valid (green) level ID opens that level's
-  page in Geometry Dash.
-- **Level-ID validation** - each distinct ID is checked once; failed lookups
-  stay gray, and lookups retry without the game-version filter to support
-  unlisted and older levels.
+- **Click-to-open** - clicking a valid level name opens that level's page in
+  Geometry Dash.
+- **Level-ID validation** - confirmed missing IDs stay gray. Network failures
+  get one retry and are not cached as invalid, so a later mention can retry.
 - **Fully asynchronous** - chat fetching runs off the game thread, so nothing
   freezes. Requests are rate-limited with a configurable poll interval.
 - **Configurable overlay** - toggle it on/off, change its position, adjust the
@@ -122,9 +121,9 @@ settings. The available settings are:
 2. Turn on **Enabled**.
 3. The overlay appears and its status line changes to `Connected` once the live
    chat is resolved.
-4. New messages scroll in. A detected ID starts gray and turns green if it
-   resolves to a level; IDs that do not resolve remain gray.
-5. Click a level ID to open its page.
+4. New messages scroll in. A detected ID starts as a gray number; if it
+   resolves, it changes to the green level name. Missing IDs stay gray numbers.
+5. Click a resolved level name to open its page.
 
 ---
 
@@ -178,9 +177,9 @@ installed automatically if a Geode profile is configured.
   visible message slides up and fades when a new message pushes it off screen.
 - **Level detection** uses a regex, strips commas, and validates the result is
   a 6+ digit number that fits in an int. Each ID is checked with the game's
-  level lookup; if the 2.2-filtered lookup fails, LiveyChat retries without
-  that filter before marking the ID invalid. Clicking an ID fetches the
-  level's metadata first, then opens its page.
+  level lookup. Results are matched to the requested ID, and network failures
+  remain retryable. Clicking an ID fetches the level's metadata first, then
+  opens its page.
 
 ---
 

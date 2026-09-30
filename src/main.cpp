@@ -601,6 +601,7 @@ private:
     void setStatus(std::string const& status);
     void queueLevelValidation(int levelID);
     void setLevelValidation(int levelID, bool valid);
+    void setLevelName(int levelID, std::string const& name);
     void startNextLevelRequest();
     void finishLevelRequest();
     void removeAnimatedRow(CCNode* node);
@@ -608,10 +609,10 @@ private:
     // Callbacks ------------------------------------------------------------
     void onLevelIDClicked(CCObject* sender);
     void openLevel(int levelID);
-    void handleLevelsLoaded(cocos2d::CCArray* levels);
-    void handleLevelsFailed();
+    void handleLevelsLoaded(cocos2d::CCArray* levels, char const* key);
+    void handleLevelsFailed(char const* key);
     void restoreLevelManagerDelegate();
-    void requestLevel(int levelID, bool withGameVersionFilter);
+    void requestLevel(int levelID);
 
     // Members ---------------------------------------------------------------
     struct RowEntry {
@@ -619,6 +620,7 @@ private:
         std::string messageId;
         std::string author;
         std::string channelId;
+        std::string text;
         std::vector<CCLabelBMFont*> fadeLabels;
         std::vector<LevelLabelEntry> levelLabels;
         bool isNew = false;
@@ -627,7 +629,7 @@ private:
     struct LevelRequest {
         int levelID = 0;
         bool openLevelWhenLoaded = false;
-        bool withGameVersionFilter = true;
+        unsigned int networkRetries = 0;
     };
 
     CCLayerColor* m_bg      = nullptr;
@@ -640,9 +642,11 @@ private:
     std::unordered_map<std::string, std::string> m_bannedUserNames;
     std::unordered_set<std::string> m_seenMessageIds;
     std::unordered_map<int, bool> m_levelIdValid;
+    std::unordered_map<int, std::string> m_levelIdNames;
     std::unordered_set<int> m_queuedLevelValidations;
     std::deque<LevelRequest> m_levelRequestQueue;
     std::optional<LevelRequest> m_activeLevelRequest;
+    std::string m_activeLevelRequestKey;
     bool m_animateRowsOnRelayout = false;
 
     LevelManagerDelegate* m_prevManagerDelegate = nullptr;
@@ -883,6 +887,7 @@ void LiveyChatOverlay::handleFetchResult(FetchResult const& f) {
         row.messageId = message.id;
         row.author = message.author;
         row.channelId = message.channelId;
+        row.text = message.text;
         row.fadeLabels = std::move(fadeLabels);
         row.levelLabels = std::move(levelLabels);
         row.isNew = true;
@@ -1047,11 +1052,17 @@ CCMenuItemSpriteExtra* LiveyChatOverlay::buildIdItem(
     float w = 0.0f, h = 0.0f;
     CCLabelBMFont* baseLabel = nullptr;
     ccColor3B color = kInvalidLevelColor;
-    if (auto it = m_levelIdValid.find(levelID); it != m_levelIdValid.end() && it->second)
+    std::string labelText = std::to_string(levelID);
+    if (auto it = m_levelIdValid.find(levelID); it != m_levelIdValid.end() && it->second) {
         color = kValidLevelColor;
+        if (auto name = m_levelIdNames.find(levelID);
+            name != m_levelIdNames.end() && !name->second.empty()) {
+            labelText = name->second;
+        }
+    }
 
     auto* labelNode = createShadowedLabel(
-        std::to_string(levelID), "chatFont.fnt", 0.5f, color, &w, &h, true,
+        labelText, "chatFont.fnt", 0.5f, color, &w, &h, true,
         &fadeLabels, &baseLabel
     );
     levelLabels.push_back(LevelLabelEntry{ levelID, baseLabel });
@@ -1185,7 +1196,7 @@ void LiveyChatOverlay::onLevelIDClicked(CCObject* sender) {
 void LiveyChatOverlay::queueLevelValidation(int levelID) {
     if (m_levelIdValid.contains(levelID)) return;
     if (!m_queuedLevelValidations.insert(levelID).second) return;
-    m_levelRequestQueue.push_back(LevelRequest{ levelID, false, true });
+    m_levelRequestQueue.push_back(LevelRequest{ levelID, false, 0 });
 }
 
 void LiveyChatOverlay::setLevelValidation(int levelID, bool valid) {
@@ -1206,6 +1217,40 @@ void LiveyChatOverlay::setLevelValidation(int levelID, bool valid) {
     }
 }
 
+void LiveyChatOverlay::setLevelName(int levelID, std::string const& name) {
+    if (name.empty()) return;
+    m_levelIdNames[levelID] = name;
+    bool rowsChanged = false;
+
+    for (auto& row : m_rows) {
+        bool containsLevel = std::any_of(
+            row.levelLabels.begin(), row.levelLabels.end(),
+            [&](LevelLabelEntry const& entry) { return entry.levelID == levelID; });
+        if (!containsLevel || !row.node) continue;
+
+        ChatMessage message;
+        message.id = row.messageId;
+        message.author = row.author;
+        message.channelId = row.channelId;
+        message.text = row.text;
+
+        std::vector<CCLabelBMFont*> fadeLabels;
+        std::vector<LevelLabelEntry> levelLabels;
+        auto* replacement = this->buildMessageRow(message, fadeLabels, levelLabels);
+        replacement->setPosition(row.node->getPosition());
+        m_content->addChild(replacement, row.node->getZOrder());
+        row.node->removeFromParentAndCleanup(true);
+
+        row.node = replacement;
+        row.fadeLabels = std::move(fadeLabels);
+        row.levelLabels = std::move(levelLabels);
+        rowsChanged = true;
+    }
+
+    if (rowsChanged)
+        this->applyPosition();
+}
+
 void LiveyChatOverlay::startNextLevelRequest() {
     if (m_activeLevelRequest || m_levelRequestQueue.empty()) return;
 
@@ -1215,29 +1260,28 @@ void LiveyChatOverlay::startNextLevelRequest() {
     auto glm = GameLevelManager::sharedState();
     m_prevManagerDelegate = glm->m_levelManagerDelegate;
     glm->m_levelManagerDelegate = this;
-    this->requestLevel(m_activeLevelRequest->levelID,
-                       m_activeLevelRequest->withGameVersionFilter);
+    this->requestLevel(m_activeLevelRequest->levelID);
 }
 
 void LiveyChatOverlay::finishLevelRequest() {
     this->restoreLevelManagerDelegate();
+    m_activeLevelRequestKey.clear();
     m_activeLevelRequest.reset();
     this->startNextLevelRequest();
 }
 
 void LiveyChatOverlay::openLevel(int levelID) {
     // Put user clicks ahead of background validation requests.
-    m_levelRequestQueue.push_front(LevelRequest{ levelID, true, true });
+    m_levelRequestQueue.push_front(LevelRequest{ levelID, true, 0 });
     this->startNextLevelRequest();
 }
 
-void LiveyChatOverlay::requestLevel(int levelID, bool withGameVersionFilter) {
+void LiveyChatOverlay::requestLevel(int levelID) {
     auto glm = GameLevelManager::sharedState();
     std::string query = std::to_string(levelID);
-    if (withGameVersionFilter)
-        query += "&gameVersion=22";
-
     auto search = GJSearchObject::create(SearchType::Type19, query);
+    auto key = search->getKey();
+    m_activeLevelRequestKey = key ? key : "";
     glm->getOnlineLevels(search);
 }
 
@@ -1248,59 +1292,90 @@ void LiveyChatOverlay::restoreLevelManagerDelegate() {
     m_prevManagerDelegate = nullptr;
 }
 
-void LiveyChatOverlay::handleLevelsLoaded(cocos2d::CCArray* levels) {
-    if (!m_activeLevelRequest) return;
+void LiveyChatOverlay::handleLevelsLoaded(cocos2d::CCArray* levels, char const* key) {
+    if (!m_activeLevelRequest || !key || m_activeLevelRequestKey != key) return;
 
-    if (levels && levels->count() > 0) {
+    GJGameLevel* requestedLevel = nullptr;
+    if (levels) {
+        for (unsigned int i = 0; i < levels->count(); ++i) {
+            auto* level = static_cast<GJGameLevel*>(levels->objectAtIndex(i));
+            if (level && level->m_levelID.value() == m_activeLevelRequest->levelID) {
+                requestedLevel = level;
+                break;
+            }
+        }
+    }
+
+    if (requestedLevel) {
+        this->setLevelValidation(m_activeLevelRequest->levelID, true);
+        this->setLevelName(
+            m_activeLevelRequest->levelID,
+            requestedLevel->m_levelName.c_str());
         if (m_activeLevelRequest->openLevelWhenLoaded) {
-            auto* level = static_cast<GJGameLevel*>(levels->objectAtIndex(0));
-            auto* scene = LevelInfoLayer::scene(level, false);
+            auto* scene = LevelInfoLayer::scene(requestedLevel, false);
             CCDirector::sharedDirector()->pushScene(scene);
         }
-        this->setLevelValidation(m_activeLevelRequest->levelID, true);
-        this->finishLevelRequest();
-        return;
+    } else {
+        if (m_activeLevelRequest->openLevelWhenLoaded)
+            log::warn("LiveyChat: level {} was not found", m_activeLevelRequest->levelID);
+        this->setLevelValidation(m_activeLevelRequest->levelID, false);
     }
-
-    if (m_activeLevelRequest->withGameVersionFilter) {
-        m_activeLevelRequest->withGameVersionFilter = false;
-        this->requestLevel(m_activeLevelRequest->levelID, false);
-        return;
-    }
-
-    if (m_activeLevelRequest->openLevelWhenLoaded)
-        log::warn("LiveyChat: level {} was not found", m_activeLevelRequest->levelID);
-    this->setLevelValidation(m_activeLevelRequest->levelID, false);
     this->finishLevelRequest();
 }
 
 void LiveyChatOverlay::loadLevelsFinished(cocos2d::CCArray* levels, char const* key) {
-    this->handleLevelsLoaded(levels);
+    if (!m_activeLevelRequest || !key || m_activeLevelRequestKey != key) {
+        if (m_prevManagerDelegate)
+            m_prevManagerDelegate->loadLevelsFinished(levels, key);
+        return;
+    }
+    this->handleLevelsLoaded(levels, key);
 }
 
 void LiveyChatOverlay::loadLevelsFailed(char const* key) {
-    this->handleLevelsFailed();
+    if (!m_activeLevelRequest || !key || m_activeLevelRequestKey != key) {
+        if (m_prevManagerDelegate)
+            m_prevManagerDelegate->loadLevelsFailed(key);
+        return;
+    }
+    this->handleLevelsFailed(key);
 }
 
 void LiveyChatOverlay::loadLevelsFinished(cocos2d::CCArray* levels, char const* key, int type) {
-    this->handleLevelsLoaded(levels);
+    if (!m_activeLevelRequest || !key || m_activeLevelRequestKey != key) {
+        if (m_prevManagerDelegate)
+            m_prevManagerDelegate->loadLevelsFinished(levels, key, type);
+        return;
+    }
+    this->handleLevelsLoaded(levels, key);
 }
 
 void LiveyChatOverlay::loadLevelsFailed(char const* key, int type) {
-    this->handleLevelsFailed();
+    if (!m_activeLevelRequest || !key || m_activeLevelRequestKey != key) {
+        if (m_prevManagerDelegate)
+            m_prevManagerDelegate->loadLevelsFailed(key, type);
+        return;
+    }
+    this->handleLevelsFailed(key);
 }
 
-void LiveyChatOverlay::handleLevelsFailed() {
-    if (!m_activeLevelRequest) return;
-    if (m_activeLevelRequest->withGameVersionFilter) {
-        m_activeLevelRequest->withGameVersionFilter = false;
-        this->requestLevel(m_activeLevelRequest->levelID, false);
+void LiveyChatOverlay::handleLevelsFailed(char const* key) {
+    if (!m_activeLevelRequest || !key || m_activeLevelRequestKey != key) return;
+
+    if (m_activeLevelRequest->networkRetries == 0) {
+        auto retry = *m_activeLevelRequest;
+        ++retry.networkRetries;
+        m_levelRequestQueue.push_front(retry);
+        this->finishLevelRequest();
         return;
     }
 
+    int levelID = m_activeLevelRequest->levelID;
     if (m_activeLevelRequest->openLevelWhenLoaded)
-        log::warn("LiveyChat: failed to load level {}", m_activeLevelRequest->levelID);
-    this->setLevelValidation(m_activeLevelRequest->levelID, false);
+        log::warn("LiveyChat: failed to load level {}", levelID);
+    // A transport/server failure does not mean the level ID is invalid.
+    // Leave it uncached so a later mention can retry the lookup.
+    m_queuedLevelValidations.erase(levelID);
     this->finishLevelRequest();
 }
 

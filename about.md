@@ -4,8 +4,9 @@ Displays live YouTube chat messages in-game as a lightweight overlay in the
 corner of your screen.
 
 When a chatter's message contains a Geometry Dash level ID (a run of 6+ digits),
-that ID is rendered as a clickable chip. Clicking it opens the level page for
-that ID directly in Geometry Dash.
+LiveyChat looks it up and replaces it with the clickable level name. IDs that
+cannot be found stay as gray numbers. Clicking a resolved name opens that level
+page directly in Geometry Dash.
 
 ## Setup
 
